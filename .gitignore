@@ -1,0 +1,9 @@
+# Data files are large and re-derivable from the source CSV; the raw TfL
+# download is redistributable but there's no reason to carry 25MB in git.
+data/*.csv
+data/*.csv.gz
+.aws-sam/
+samconfig.toml
+__pycache__/
+*.pyc
+.venv/

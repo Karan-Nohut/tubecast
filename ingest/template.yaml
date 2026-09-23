@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  TfL line-status poller. Collects a historical time series of every London
+  Underground line's status, on a schedule, so there's enough data to train
+  a delay predictor later. This stack is only the ingestion step --
+  modelling and alerting come once a few weeks of data have accumulated.
+  Overground/DLR/Elizabeth line can be added later by changing the Modes
+  parameter, no code change required.
+
+Parameters:
+  TflAppKey:
+    Type: String
+    NoEcho: true
+    Description: >
+      TfL API app_key. Register free at https://api-portal.tfl.gov.uk,
+      subscribe to the "500 Requests per min" product, copy the key from
+      your profile.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Email address for pipeline failure alerts. Leave blank to skip
+      alerting (not recommended: the data this collects cannot be
+      backfilled, so a silent stop is unrecoverable). You must click the
+      confirmation link AWS emails you before alerts actually arrive.
+  Modes:
+    Type: String
+    Default: tube
+    Description: >
+      Comma-separated TfL transport modes to poll (e.g. "tube" or
+      "tube,dlr,overground,elizabeth-line"). One request returns every
+      current line for the given mode(s), so widening this later is free --
+      it doesn't add API calls, just more rows per poll.
+  PollIntervalMinutes:
+    Type: Number
+    Default: 2
+    Description: >
+      Polling one request covers every line of the given mode(s) (TfL
+      batches per mode), so even a 1-minute interval stays far under the
+      500/min limit. 2 minutes is enough resolution for time-of-day
+      patterns without generating more DynamoDB writes than necessary.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- data
+  LineStatusTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tfl-line-status-history
+      BillingMode: PAY_PER_REQUEST   # usage is low and bursty-free; avoids paying for idle provisioned capacity
+      # The forward-validation record cannot be rebuilt if it is lost -- TfL's
+      # live feed is not historically queryable at this resolution. ~£0.20/mo
+      # is the cheapest insurance in this stack.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: line_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: line_id     # partition key: query one line's full history efficiently
+          KeyType: HASH
+        - AttributeName: timestamp   # sort key: range-query by time window
+          KeyType: RANGE
+
+  # ------------------------------------------------------------ alerting
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: tubecast-pipeline-alerts
+      DisplayName: TubeCast pipeline
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ------------------------------------------------------------- compute
+  PollFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tfl-status-poller
+      Handler: poll_status.handler
+      Runtime: python3.12
+      CodeUri: src/
+      Timeout: 15
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LineStatusTable
+          TFL_APP_KEY: !Ref TflAppKey
+          MODES: !Ref Modes
+      Policies:
+        # SAM's DynamoDBWritePolicy scopes the role to exactly the writes
+        # this function needs on this table -- no wildcard dynamodb:* --
+        # rather than the default over-broad AWSLambdaBasicExecutionRole-only setup.
+        - DynamoDBWritePolicy:
+            TableName: !Ref LineStatusTable
+      Events:
+        ScheduledPoll:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub "rate(${PollIntervalMinutes} minutes)"
+            Name: tfl-poll-schedule
+            Description: Triggers a TfL line-status poll
+            Enabled: true
+
+  # --------------------------------------------------------------- alarms
+  # Three alarms, because there are three genuinely different ways this can
+  # stop collecting data and each is invisible to the other two.
+
+  # 1. The function is running but failing -- bad API key, TfL down, code bug.
+  #    Threshold is deliberately not 1: losing the odd poll to a transient
+  #    5xx is harmless at 2-minute resolution. 10 failures in an hour (of
+  #    ~30 polls) means something is persistently wrong.
+  PollErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: tubecast-poller-errors
+      AlarmDescription: >
+        TfL poller is failing repeatedly. Check CloudWatch Logs -- most
+        likely an expired/invalid TFL_APP_KEY or a TfL API change.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PollFunction
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching   # no invocations at all is alarm #2's job
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # 2. The function has stopped being invoked at all -- schedule disabled,
+  #    rule deleted, stack half-torn-down. THIS IS THE IMPORTANT ONE: the
+  #    Errors alarm can never fire for a function that isn't running, so
+  #    without this a silent stop goes unnoticed indefinitely.
+  #    TreatMissingData: breaching is what makes absence itself the signal.
+  PollSilentStopAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: tubecast-poller-stopped
+      AlarmDescription: >
+        TfL poller has stopped running. Expected ~30 invocations/hour.
+        Check the EventBridge rule tfl-poll-schedule is enabled.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PollFunction
+      Statistic: Sum
+      # Ask "were there ANY invocations in a short window", not "were there
+      # enough in a long one". A long period with a high count threshold
+      # flaps: CloudWatch evaluates the CURRENT, partial period, so an hourly
+      # window with a threshold of 20 is always below it at the top of the
+      # hour. Threshold 1 over 15 minutes can't be partially-satisfied --
+      # a live poller lands one within 2 minutes.
+      Period: 900
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2          # 2 dead windows out of 3 -> stop detected in ~30 min
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # 3. The function runs, succeeds, and writes nothing -- e.g. TfL returns
+  #    HTTP 200 with an empty array. Invisible to both alarms above, because
+  #    nothing errored and invocations look healthy. Fed by an EMF metric
+  #    the handler prints (no PutMetricData call, no extra IAM, no cost).
+  PollEmptyWritesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: tubecast-poller-writing-nothing
+      AlarmDescription: >
+        TfL poller is running without errors but writing no rows -- likely
+        an empty or changed API response. Check a recent log entry.
+      Namespace: TubeCast
+      MetricName: LinesWritten
+      Statistic: Sum
+      # Same shape as the stopped alarm, for the same reason -- see the
+      # comment there on why a long period with a count threshold flaps.
+      Period: 900
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+Outputs:
+  TableName:
+    Value: !Ref LineStatusTable
+  FunctionName:
+    Value: !Ref PollFunction
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  AlertingStatus:
+    Value: !If
+      - HasAlertEmail
+      - !Sub "Alerts to ${AlertEmail} -- CONFIRM the AWS subscription email or nothing will reach you"
+      - "NO ALERTING CONFIGURED -- redeploy with AlertEmail set"
