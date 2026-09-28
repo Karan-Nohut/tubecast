@@ -53,23 +53,50 @@ So there is real structure by hour, line and weekday. That was the first
 question — whether disruption is close enough to random that nothing
 could beat a coin flip — and the answer is no, it isn't.
 
-## What isn't established yet
+## The answer: about three hours, and not usefully beyond six
 
-Whether a model beats a lookup table of those empirical rates. Early
-indications are that the margin is small, and that most of what looks
-like predictive power at short horizons is just persistence — disruption
-comes in runs, so "it was disrupted an hour ago" is a strong and fairly
-uninteresting predictor. The real question is what survives at the 12–24
-hour horizon where someone might actually change their plans.
+Forecasting at least 15 minutes of unplanned major disruption (Severe
+Delays / Part Suspended / Suspended) in a given line-hour. Tested on
+May–August 2026, held out from training.
 
-I'd rather publish that honestly than headline a number that turns out to
-be measuring the wrong thing. Results expected mid-October.
+![skill decay](analysis/results/skill_decay.png)
+
+Skill roughly halves every two hours of lead time. By a day ahead the model
+is **not significantly better than a lookup table** of per-line, per-hour,
+per-weekday historical rates — uplift +0.016 PR-AUC, 95% CI [−0.001,
++0.033], crossing zero.
+
+The mechanism shows up in a calendar-only model, which sits flat at ~0.161
+at every horizon. At zero lead, recency features carry nearly everything
+(0.827 vs 0.161). At 24 hours they carry nothing — and the full model is
+actually *worse* than calendar-only on ROC and recall. A day ahead,
+recency isn't merely uninformative, it's noise the model overfits.
+
+## So the alert doesn't get built
+
+The point of this was a morning alert. Here is what one would do, weekday
+07:00–09:00, on the four lines I commute on, firing on ~10% of mornings:
+
+![commute precision](analysis/results/commute_precision.png)
+
+A day-ahead alert is worse than firing at random. I cancelled the feature
+on that evidence rather than shipping it.
+
+What does work is a nowcast — 0.80 precision at zero lead. But I should be
+straight about what that is: at zero lead it answers the same question
+TfL's own status API already answers, and its contribution over a
+two-line persistence rule is real but modest. Calling it a forecast would
+be overselling it.
+
+Full method, the statistics, and the off-by-one bug that nearly produced a
+much more flattering answer are in [NOTES.md](NOTES.md).
 
 ## Layout
 
 ```
 ingest/       live poller — Lambda + SAM stack (EventBridge → Lambda → DynamoDB)
 historical/   builds the continuous hourly dataset from TfL's published log
+analysis/     the horizon study, charts, and results
 data/         not tracked; see data/README.md to re-derive
 NOTES.md      engineering log — decisions, gotchas, and things I got wrong
 ```
@@ -79,6 +106,10 @@ NOTES.md      engineering log — decisions, gotchas, and things I got wrong
 ```bash
 # historical dataset
 python3 historical/build_historical.py     # validates its own invariants, exits 1 on failure
+
+# the horizon study (needs analysis/requirements.txt)
+python3 analysis/horizon_study.py
+python3 analysis/make_charts.py
 
 # live poller
 cd ingest

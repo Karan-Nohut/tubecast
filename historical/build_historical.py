@@ -82,6 +82,12 @@ LINE_TO_ID = {
 # Scheduled overnight closure -- not a disruption, and trivially predictable.
 CLOSED_STATUSES = {"Service Closed", "Closed"}
 
+# The states an alert would actually be about: part or all of the line not
+# running, or delays severe enough to change a journey. Deliberately excludes
+# "Minor Delays", which is the single largest contributor to the raw
+# disruption rate and is not a reason to leave the house early.
+MAJOR_STATUSES = {"Severe Delays", "Part Suspended", "Suspended"}
+
 # Everything else non-good counts as disruption, UNLESS flagged planned below.
 PLANNED_STATUSES = {"Planned Closure"}
 PLANNED_TEXT = ("planned engineering work", "planned closure", "planned work")
@@ -212,6 +218,8 @@ def overlap_intervals(events):
                 # disrupted, and contaminated the severity target with
                 # pre-announced works. Asserted in validate_outputs().
                 if kind == "disrupted":
+                    if e["status"] in MAJOR_STATUSES:
+                        buckets[(e["line_id"], cur)]["major"].append((a, b))
                     if e["status"] == "Severe Delays":
                         buckets[(e["line_id"], cur)]["severe"].append((a, b))
                     elif e["status"] == "Minor Delays":
@@ -245,16 +253,20 @@ def write_hourly(events, buckets):
         w = csv.writer(f)
         w.writerow([
             "line_id", "hour_utc", "date", "hour", "day_of_week", "is_weekend",
-            "disrupted_min", "severe_min", "minor_min", "planned_min", "closed_min",
-            "any_disruption",
+            "hour_local", "dow_local", "is_weekend_local",
+            "disrupted_min", "major_min", "severe_min", "minor_min",
+            "planned_min", "closed_min",
+            "any_disruption", "major_disruption",
         ])
         cur = start
         while cur <= end:
             dow = cur.strftime("%A")
             weekend = int(cur.weekday() >= 5)
+            local = cur.astimezone(LONDON)
             for lid in line_ids:
                 b = buckets.get((lid, cur), {})
                 dis = union_seconds(b.get("disrupted", [])) / 60
+                maj = union_seconds(b.get("major", [])) / 60
                 sev = union_seconds(b.get("severe", [])) / 60
                 mnr = union_seconds(b.get("minor", [])) / 60
                 pln = union_seconds(b.get("planned", [])) / 60
@@ -262,9 +274,10 @@ def write_hourly(events, buckets):
                 w.writerow([
                     lid, cur.isoformat(), cur.date().isoformat(), cur.hour,
                     dow, weekend,
-                    round(dis, 2), round(sev, 2), round(mnr, 2),
+                    local.hour, local.strftime("%A"), int(local.weekday() >= 5),
+                    round(dis, 2), round(maj, 2), round(sev, 2), round(mnr, 2),
                     round(pln, 2), round(cld, 2),
-                    int(dis > 0),
+                    int(dis > 0), int(maj >= 15),
                 ])
                 rows += 1
             cur += timedelta(hours=1)
@@ -279,9 +292,9 @@ def validate_outputs():
         for r in _csv.DictReader(f):
             dis = float(r["disrupted_min"]); sev = float(r["severe_min"])
             mnr = float(r["minor_min"]); pln = float(r["planned_min"])
-            cld = float(r["closed_min"])
-            for name, v in (("disrupted", dis), ("severe", sev), ("minor", mnr),
-                            ("planned", pln), ("closed", cld)):
+            cld = float(r["closed_min"]); maj = float(r["major_min"])
+            for name, v in (("disrupted", dis), ("major", maj), ("severe", sev),
+                            ("minor", mnr), ("planned", pln), ("closed", cld)):
                 if v > 60.01:
                     problems[f"{name}>60"] += 1
             # severe and minor are unplanned-disruption subsets by construction
@@ -289,6 +302,12 @@ def validate_outputs():
                 problems["severe>disrupted"] += 1
             if mnr > dis + 0.01:
                 problems["minor>disrupted"] += 1
+            if maj > dis + 0.01:
+                problems["major>disrupted"] += 1
+            if sev > maj + 0.01:
+                problems["severe>major"] += 1        # severe is a subset of major
+            if (maj >= 15) != (int(r["major_disruption"]) == 1):
+                problems["major_flag_mismatch"] += 1
             if (dis > 0) != (int(r["any_disruption"]) == 1):
                 problems["flag_mismatch"] += 1
     return problems

@@ -170,6 +170,20 @@ Three alarms rather than one, because the failure modes don't overlap:
    both of the above. Fed by an EMF metric printed from the handler, so it
    costs nothing.
 
+**A mistake I made setting these up:** my first version of the "has it
+stopped" alarm asked *"were there at least 20 invocations in the last
+hour?"*. It emailed me twice an hour, forever. CloudWatch evaluates the
+**current, partial** period — so an hourly window with a count threshold of
+20 is always below it at the top of the hour, then recovers mid-hour. A
+long period plus a high count threshold is a flapping alarm by
+construction.
+
+The fix is to ask a question a partial window can still answer: *"were
+there **any** invocations in the last 15 minutes?"*, requiring 2 dead
+windows out of 3 before alarming. Threshold 1 can't be partially
+satisfied — a live poller lands one within two minutes — so it only fires
+when collection has genuinely stopped, and still detects it in ~30 min.
+
 One deliberate omission: I didn't put a `AWS::Logs::LogGroup` in the template
 to set log retention. The group already exists (Lambda created it on first
 invocation), and CloudFormation would fail trying to create a resource that's
@@ -186,3 +200,111 @@ aws logs put-retention-policy \
 Ingestion running since 3 September 2026. Historical dataset built and
 validated. Modelling in progress — see README for what's been established
 so far and what hasn't.
+
+---
+
+## The horizon study (28 Sept 2026)
+
+### What I asked
+
+Not "can I predict disruption" but "how far ahead can I predict it, and does
+a model beat just knowing the historical rate for this line at this hour".
+The second half is the part most projects skip, and it is the part that
+decides whether any of this was worth building.
+
+### Target
+
+`major_disruption` — at least 15 minutes of unplanned **Severe Delays /
+Part Suspended / Suspended** in the hour. 8.2% of service hours.
+
+Deliberately not "any disruption": that fires on 19% of hours and is
+dominated by Minor Delays, which is not a reason to leave the house early.
+Deliberately not duration-thresholded either — I checked, and the median
+disrupted hour is *entirely* disrupted, so cutting on minutes barely moves
+the base rate. Severity is the axis that does the work, not duration.
+
+Planned engineering works are excluded: they're published weeks ahead, so
+predicting them is trivial and proves nothing.
+
+### The off-by-one that nearly ruined it
+
+My first run reported a "1 hour ahead" PR-AUC of 0.83. It was wrong — not
+leaking in the obvious sense, but mislabelled.
+
+To forecast the hour starting 08:00 with one hour of warning, I issue the
+prediction at 07:00. At that moment the most recently *completed* hour is
+06:00–07:00 — so the newest usable lag is `shift(2)`, not `shift(1)`.
+`shift(1)` means reading the outcome of 07:00–08:00, which hasn't finished
+yet when the forecast is issued.
+
+Using `shift(h)` gave every horizon one extra hour of information it
+wouldn't have. At the short end that is enormous, because disruption comes
+in runs and the immediately preceding hour is by far the strongest single
+predictor. The fix is one character; finding it was the whole difference
+between a real result and a flattering one.
+
+`lead = 0` is now kept deliberately as a reference point — the forecast
+issued at the instant the hour begins. That's the "is the line broken right
+now" question the TfL app already answers, and it's the ceiling every real
+forecast gets measured against.
+
+### Result
+
+PR-AUC on the held-out test period (May–Aug 2026), service hours only:
+
+| lead | model | lookup table | uplift | significant? |
+|---|---|---|---|---|
+| 0h (nowcast) | 0.827 | 0.148 | +0.675 | yes |
+| 1h | 0.625 | 0.148 | +0.472 | yes |
+| 2h | 0.496 | 0.148 | +0.343 | yes |
+| 3h | 0.408 | 0.148 | +0.256 | yes |
+| 6h | 0.275 | 0.148 | +0.126 | yes |
+| 12h | 0.197 | 0.148 | +0.051 | yes |
+| **24h** | **0.164** | **0.149** | **+0.016** | **no — CI [-0.001, +0.033]** |
+
+Skill roughly halves every two hours of lead, and by a day ahead the model
+is statistically indistinguishable from a lookup table of historical rates.
+
+The mechanism is visible in the calendar-only model, which sits flat at
+~0.161 at every horizon: at lead 0 the recency features carry almost
+everything (0.827 vs 0.161), and by 24h they carry nothing — the full model
+is *worse* than calendar-only on ROC and on recall-at-budget. A day ahead,
+recency isn't just uninformative, it's noise the model overfits.
+
+### The product answer
+
+Weekday 07:00–09:00, my four lines, firing on ~10% of mornings:
+
+| lead | precision | base rate |
+|---|---|---|
+| 0h | 0.80 | 0.107 |
+| 3h | 0.28 | 0.107 |
+| 12h | 0.10 | 0.107 |
+| 24h | 0.05 | 0.107 |
+
+A day-ahead alert is **worse than firing at random**. So the morning alert
+is cancelled — not because I ran out of time, but because I measured it and
+it doesn't work.
+
+What does work is a nowcast, and I should be honest about what that is: at
+zero lead time it's answering the same question TfL's own status API
+answers. Its contribution over a two-line persistence rule is real but
+modest. Calling it a forecast would be overselling it.
+
+### Statistics notes
+
+- **Bootstrap resamples whole days, not rows.** Disruption clusters — one
+  signal failure spans several hours, and weather or strikes correlate
+  across lines. Row-level resampling treats those as independent and gives
+  confidence intervals several times too narrow.
+- **Service hours only.** ~16% of the grid is the overnight closure where
+  major disruption is near-impossible; leaving it in inflates every
+  discrimination metric for free.
+- **The baseline is shrunk as well as raw.** An empirical-Bayes version
+  pulls sparse cells toward the global rate, so a cell with three
+  observations can't claim a rate of 1.0. It makes the bar harder to clear,
+  which is the point of a baseline.
+- **Base rate drifts**: 7–8% in train, 11.1% in test. Part of that is real,
+  part is TfL emitting more, shorter status messages over time. It's why
+  calibration isn't the headline metric here — a calibration curve on this
+  split measures the drift more than the model.
